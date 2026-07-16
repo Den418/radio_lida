@@ -186,6 +186,11 @@ async def main():
         log.error("Не удалось запустить радио: %s", e)
         log.error("Проверь CHAT_ID и что юзербот — участник чата")
 
+    # 6. Запускаем сторожа — следит, что бот реально играет, если должен,
+    # и сам переподключается, если голосовой чат оборвался
+    asyncio.create_task(utils.watchdog_loop())
+    log.info("Сторож соединения запущен, проверка каждые %s секунд", utils.WATCHDOG_INTERVAL)
+
     print("\n" + "═" * 50)
     print(f"  «{Config.RADIO_NAME}» работает!")
     print(f"  Бот:   @{bot_me.username}")

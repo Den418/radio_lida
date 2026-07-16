@@ -37,6 +37,7 @@ from pytgcalls.types import (
     VideoQuality,
     StreamEnded,
     ChatUpdate,
+    Call,
     Update,
 )
 
@@ -88,6 +89,16 @@ _YTDLP_VIDEO = "--format bestvideo[height<=720]+bestaudio/best/best"
 # пока играет звук (обычные картинки library и так зацикливает сама).
 _LOOPABLE_BANNER_EXT = (".mp4", ".mov", ".webm", ".mkv", ".gif", ".m4v", ".avi")
 
+# ─── Автопереподключение, если голосовой чат отвалился сам по себе ────────────
+# Если реконнекты происходят слишком часто подряд — значит что-то сломано
+# по-настоящему (например, юзербота выгнали), и долбить API дальше смысла
+# нет. Ставим потолок на окно времени.
+_RECONNECT_WINDOW = 300      # 5 минут
+_RECONNECT_MAX = 5           # не больше стольких попыток за это время
+_reconnect_state = {"count": 0, "window_start": time.time()}
+
+WATCHDOG_INTERVAL = 45       # как часто "сторож" проверяет, что всё играет
+
 # ─── PyTgCalls — главный объект голосовых чатов ───────────────────────────────
 call = PyTgCalls(USER)
 
@@ -121,6 +132,12 @@ async def youtube_lookup(query: str) -> dict | None:
 #  MusicPlayer — управление воспроизведением
 # ══════════════════════════════════════════════════════════════════════════════
 class MusicPlayer:
+
+    def __init__(self):
+        # True, если бот ДОЛЖЕН сейчас что-то играть. Нужно, чтобы отличать
+        # "отвалились сами по себе, надо переподключиться" от "админ сам
+        # нажал /leave или /stopradio, переподключаться не надо".
+        self.should_be_playing = False
 
     # ── Отображение плейлиста ─────────────────────────────────────────────────
 
@@ -288,12 +305,14 @@ class MusicPlayer:
         if EDIT_TITLE and RADIO_TITLE:
             await self.edit_title(RADIO_TITLE)
 
+        self.should_be_playing = True
         Stats.is_paused = False
         log.info("Радио запущено")
 
     async def stop_radio(self):
         """Остановить воспроизведение и покинуть голосовой чат."""
         playlist.clear()
+        self.should_be_playing = False
         try:
             await call.leave_call(CHAT_ID)
             log.info("Вышли из голосового чата")
@@ -345,6 +364,7 @@ class MusicPlayer:
         Stats.requesters[song[4]] += 1
         Stats.history.appendleft(song[1])
         Stats.is_paused = False
+        self.should_be_playing = True
 
         await self.send_playlist()
         log.info("Играет: %s, запросил %s", song[1], song[4])
@@ -557,6 +577,37 @@ admin_filter = filters.create(_admin_check)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  Заслон от слишком частых переподключений
+#
+#  Если что-то сломано по-настоящему (юзербота выгнали, сессия слетела),
+#  реконнект будет проваливаться раз за разом. Без этого заслона бот бы
+#  долбил Telegram API бесконечно. С заслоном — после нескольких неудач
+#  подряд он останавливается и просто пишет в лог, что дальше сам не может.
+# ══════════════════════════════════════════════════════════════════════════════
+def _can_reconnect() -> bool:
+    now = time.time()
+    if now - _reconnect_state["window_start"] > _RECONNECT_WINDOW:
+        _reconnect_state["count"] = 0
+        _reconnect_state["window_start"] = now
+    if _reconnect_state["count"] >= _RECONNECT_MAX:
+        return False
+    _reconnect_state["count"] += 1
+    return True
+
+
+async def _reconnect():
+    """Попытаться восстановить воспроизведение с того же места, где остановились."""
+    try:
+        if playlist:
+            await mp.play_song(playlist[0])
+        else:
+            await mp.start_radio()
+        log.info("Переподключились и продолжили воспроизведение")
+    except Exception as e:
+        log.error("Не удалось переподключиться: %s", e)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  Обработчики событий PyTgCalls
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -582,12 +633,67 @@ async def _on_call_update(_, update: Update):
         if update.chat_id != CHAT_ID:
             return
 
+        # Юзербота выгнали из самого чата — переподключаться бессмысленно,
+        # прав всё равно нет, тут нужен человек, чтобы пригласить обратно.
         kicked_statuses = {
             ChatUpdate.Status.KICKED,
             ChatUpdate.Status.LEFT_GROUP,
+        }
+        # А это — обрыв именно голосового чата/звонка, не всего чата целиком.
+        # Обычно происходит само по себе: Telegram прикрыл звонок за
+        # неактивностью, или было временное подключение. Тут можно и нужно
+        # попробовать восстановиться самим.
+        dropped_statuses = {
             ChatUpdate.Status.CLOSED_VOICE_CHAT,
+            ChatUpdate.Status.DISCARDED_CALL,
+            ChatUpdate.Status.LEFT_CALL,
         }
 
         if update.status in kicked_statuses:
-            log.warning("Статус чата изменился: %s, очищаем очередь", update.status)
+            log.warning("Юзербота выгнали из чата (%s), останавливаемся", update.status)
             playlist.clear()
+            mp.should_be_playing = False
+
+        elif update.status in dropped_statuses:
+            log.warning("Голосовой чат оборвался (%s)", update.status)
+            if mp.should_be_playing and _can_reconnect():
+                await sleep(3)
+                await _reconnect()
+            elif mp.should_be_playing:
+                log.error(
+                    "Слишком много обрывов подряд за последние %s секунд, "
+                    "останавливаю автопереподключение, посмотри логи руками",
+                    _RECONNECT_WINDOW,
+                )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Сторож — на случай, если Telegram оборвёт звонок так, что событие выше
+#  вообще не долетит (бывает при сетевых проблемах). Раз в WATCHDOG_INTERVAL
+#  секунд проверяет, что бот реально играет, если должен, и если нет —
+#  тоже пробует переподключиться.
+# ══════════════════════════════════════════════════════════════════════════════
+async def watchdog_loop():
+    while True:
+        await sleep(WATCHDOG_INTERVAL)
+        if not mp.should_be_playing:
+            continue
+        try:
+            calls_now = await call.calls
+            active = (
+                CHAT_ID in calls_now
+                and calls_now[CHAT_ID].playback == Call.Status.ACTIVE
+            )
+        except Exception:
+            active = False
+
+        if not active:
+            log.warning("Сторож: соединения нет, а должно быть, пробуем восстановить")
+            if _can_reconnect():
+                await _reconnect()
+            else:
+                log.error(
+                    "Сторож: слишком много попыток за последние %s секунд, "
+                    "жду следующей проверки",
+                    _RECONNECT_WINDOW,
+                )
