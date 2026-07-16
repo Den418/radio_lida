@@ -37,7 +37,6 @@ from pytgcalls.types import (
     VideoQuality,
     StreamEnded,
     ChatUpdate,
-    Call,
     Update,
 )
 
@@ -96,6 +95,11 @@ _LOOPABLE_BANNER_EXT = (".mp4", ".mov", ".webm", ".mkv", ".gif", ".m4v", ".avi")
 _RECONNECT_WINDOW = 300      # 5 минут
 _RECONNECT_MAX = 5           # не больше стольких попыток за это время
 _reconnect_state = {"count": 0, "window_start": time.time()}
+
+# У видео звук и картинка — отдельные потоки, оба могут сообщить об
+# окончании почти одновременно. Не даём такому двойному сигналу пропустить
+# сразу два трека в очереди вместо одного.
+_stream_ended_state = {"last": 0.0}
 
 WATCHDOG_INTERVAL = 45       # как часто "сторож" проверяет, что всё играет
 
@@ -618,10 +622,17 @@ async def _on_call_update(_, update: Update):
     if isinstance(update, StreamEnded):
         if update.chat_id != CHAT_ID:
             return
-        if update.stream_type != StreamEnded.Type.AUDIO:
-            return
 
-        log.info("Поток завершился в чате %s", update.chat_id)
+        # Для видео звук и картинка — два отдельных потока, и оба могут
+        # прислать "закончилось" почти одновременно. Обрабатываем только
+        # первое из этих двух событий, чтобы не пропустить трек в очереди
+        # сразу на два вперёд.
+        now = time.time()
+        if now - _stream_ended_state["last"] < 2:
+            return
+        _stream_ended_state["last"] = now
+
+        log.info("Поток (%s) завершился в чате %s", update.stream_type, update.chat_id)
 
         if playlist:
             await mp.skip_current_playing()
@@ -680,14 +691,11 @@ async def watchdog_loop():
             continue
         try:
             calls_now = await call.calls
-            active = (
-                CHAT_ID in calls_now
-                and calls_now[CHAT_ID].playback == Call.Status.ACTIVE
-            )
+            connected = CHAT_ID in calls_now
         except Exception:
-            active = False
+            connected = False
 
-        if not active:
+        if not connected:
             log.warning("Сторож: соединения нет, а должно быть, пробуем восстановить")
             if _can_reconnect():
                 await _reconnect()
